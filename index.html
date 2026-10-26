@@ -40,11 +40,29 @@
     display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
     background:var(--paper); border:1px solid var(--line); border-radius:10px;
     padding:0.75rem 1rem; margin-bottom:1.25rem; font-size:13px; color:var(--ink-soft);
+    position:relative; overflow:hidden;
   }
   .status-left{ display:flex; align-items:center; gap:8px; }
   .dot{ width:8px; height:8px; border-radius:50%; background:var(--ink-faint); flex-shrink:0; }
   .dot.on{ background:#3B8F6F; }
   .dot.off{ background:var(--danger); }
+  .dot.loading{ background:var(--amber); animation:pulse 1s ease-in-out infinite; }
+  @keyframes pulse{ 50%{ opacity:0.3; } }
+
+  /* loading indicator: slim bar along the bottom of the status bar + skeleton cards */
+  .progress{ position:absolute; left:0; right:0; bottom:0; height:3px; background:var(--amber-bg); opacity:0; transition:opacity .2s; pointer-events:none; }
+  .progress.on{ opacity:1; }
+  .progress-bar{ height:100%; width:35%; background:var(--amber); border-radius:3px; animation:slide 1.1s ease-in-out infinite; }
+  @keyframes slide{ 0%{ transform:translateX(-100%); } 100%{ transform:translateX(300%); } }
+  .item-card.skeleton{ pointer-events:none; }
+  .skel{ background:linear-gradient(90deg, var(--bg) 25%, #F6F8F7 50%, var(--bg) 75%); background-size:200% 100%; animation:shimmer 1.4s linear infinite; border-radius:var(--radius-sm); }
+  .skel-thumb{ width:52px; height:52px; flex-shrink:0; }
+  .skel-line{ height:12px; margin:4px 0 10px; }
+  @keyframes shimmer{ 0%{ background-position:200% 0; } 100%{ background-position:-200% 0; } }
+  @media (prefers-reduced-motion: reduce){
+    .dot.loading, .progress-bar, .skel{ animation:none; }
+    .progress-bar{ width:100%; opacity:0.6; }
+  }
   .status-actions{ display:flex; gap:8px; }
   .icon-btn{
     display:inline-flex; align-items:center; gap:6px; background:var(--paper);
@@ -167,9 +185,10 @@
   <div class="status-bar">
     <div class="status-left">
       <span class="dot" id="status-dot"></span>
-      <span id="status-text">Not signed in</span>
+      <span id="status-text" aria-live="polite">Not signed in</span>
     </div>
     <div class="status-actions">
+      <a class="icon-btn" id="open-full" href="#" target="_blank" rel="noopener" style="display:none; text-decoration:none;">Open full page &#8599;</a>
       <button class="icon-btn" id="reload-btn" style="display:none;">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4v6h6"/><path d="M20 20v-6h-6"/><path d="M5 15a8 8 0 0 0 14-4"/><path d="M19 9A8 8 0 0 0 5 13"/></svg>
         Reload
@@ -183,6 +202,7 @@
         Container images
       </button>
     </div>
+    <div class="progress" id="progress" role="progressbar" aria-label="Loading"><div class="progress-bar"></div></div>
   </div>
 
   <div class="form-panel" id="container-panel">
@@ -316,7 +336,10 @@
   var GRAPH_SCOPES = ['Files.ReadWrite'];
   // Must match the SPA redirect URI registered in Azure exactly (trailing slash, no index.html)
   var REDIRECT_URI = window.location.origin + window.location.pathname.replace(/index\.html$/, '');
-  var HINT_KEY = 'inv_login_hint';          // remembered username, so Microsoft can skip the account picker
+  // True when this page is embedded in another page (e.g. the dashboard). Microsoft's sign-in page
+  // refuses to load inside a frame, so a framed page must sign in through a popup window instead.
+  var FRAMED = (window.self !== window.top);
+  var HINT_KEY = 'inv_login_hint';         // remembered username, so Microsoft can skip the account picker
   var AUTO_KEY = 'inv_auto_redirect_ts';    // time of the last automatic sign-in redirect (loop guard)
   var AUTO_COOLDOWN_MS = 5 * 60 * 1000;
   var msalInstance = new msal.PublicClientApplication({
@@ -353,6 +376,9 @@
   var reloadBtn = document.getElementById('reload-btn');
   var statusDot = document.getElementById('status-dot');
   var statusText = document.getElementById('status-text');
+  var progressEl = document.getElementById('progress');
+  var openFull = document.getElementById('open-full');
+  var loading = false;
 
   var fDescription = document.getElementById('f-description');
   var fQuantity = document.getElementById('f-quantity');
@@ -544,6 +570,32 @@
     statusText.textContent = text;
   }
 
+  // Loading indicator: pulsing dot + moving bar in the status bar, plus placeholder cards in the list
+  // while there is nothing to show yet.
+  function setLoading(on, msg){
+    loading = !!on;
+    progressEl.classList.toggle('on', loading);
+    connectBtn.disabled = loading;   // no second sign-in while one is already running
+    if (loading){
+      statusDot.className = 'dot loading';
+      if (msg) statusText.textContent = msg;
+      if (items.length === 0) renderSkeleton();
+    } else if (statusDot.classList.contains('loading')){
+      statusDot.className = 'dot';
+    }
+  }
+  function setLoadingMsg(msg){ if (loading) statusText.textContent = msg; }
+
+  function renderSkeleton(){
+    emptyEl.style.display = 'none';
+    var card = '<div class="item-card skeleton" aria-hidden="true">' +
+      '<div class="skel skel-thumb"></div>' +
+      '<div class="item-main"><div class="skel skel-line" style="width:55%;"></div>' +
+      '<div class="skel skel-line" style="width:35%;height:10px;"></div>' +
+      '<div class="skel skel-line" style="width:70%;height:10px;margin-bottom:2px;"></div></div></div>';
+    listEl.innerHTML = card + card + card + card;
+  }
+
   async function graphRequest(path, options){
     options = options || {};
     options.headers = Object.assign({ Authorization: 'Bearer ' + accessToken }, options.headers || {});
@@ -641,21 +693,37 @@
     });
   }
 
-  async function startRedirectSignIn(forcePicker){
+  // Normal page: full-page redirect to Microsoft and back.
+  // Page embedded in the dashboard: Microsoft cannot load inside a frame, so use a popup window instead.
+  async function startSignIn(forcePicker){
     await msalReady;
     clearStuckInteraction();
     var req = { scopes: GRAPH_SCOPES, redirectUri: REDIRECT_URI };
     var hint = getHint();
     if (forcePicker) req.prompt = 'select_account';
     else if (hint) req.loginHint = hint;
+    if (FRAMED){
+      var resp = await msalInstance.loginPopup(req);
+      msalAccount = resp.account;
+      accessToken = resp.accessToken;
+      await afterSignIn();
+      return;
+    }
     await msalInstance.loginRedirect(req);
   }
 
   async function signIn(){
     try {
-      await startRedirectSignIn(writable);   // already signed in = "Switch account", so show the picker
+      await startSignIn(writable);   // already signed in = "Switch account", so show the picker
     } catch(err){
       console.error(err);
+      setLoading(false);
+      var code = err && err.errorCode;
+      if (code === 'user_cancelled') return;   // closed the sign-in window on purpose
+      if (code === 'popup_window_error' || code === 'empty_window_error'){
+        alert('Your browser blocked the sign-in window.\n\nAllow pop-ups for this site and try again, or use "Open full page" and sign in there.');
+        return;
+      }
       var detail = (err && (err.errorCode || err.message)) ? (err.errorCode || err.message) : 'unknown error';
       alert('Sign-in failed: ' + detail + '\n\nIf this mentions "AADSTS", it\'s worth sending that code back for a fix.');
     }
@@ -689,10 +757,15 @@
     try { msalInstance.setActiveAccount(msalAccount); } catch(e){}
     setHint(msalAccount.username);
     try { localStorage.removeItem(AUTO_KEY); } catch(e){}
-    await ensureFolder('/' + ONEDRIVE_FOLDER);
-    await ensureFolder('/' + ONEDRIVE_FOLDER + '/photos');
-    await ensureFolder('/' + ONEDRIVE_FOLDER + '/containers');
-    await loadAllData();
+    setLoading(true, 'Signed in — opening your OneDrive folder…');
+    try {
+      await ensureFolder('/' + ONEDRIVE_FOLDER);
+      await ensureFolder('/' + ONEDRIVE_FOLDER + '/photos');
+      await ensureFolder('/' + ONEDRIVE_FOLDER + '/containers');
+      await loadAllData();
+    } finally {
+      setLoading(false);
+    }
     writable = true;
     addBtn.disabled = false;
     containersBtn.disabled = false;
@@ -703,11 +776,14 @@
   }
 
   async function loadAllData(){
+    setLoadingMsg('Loading your items…');
     var csvText = await graphReadText('/' + ONEDRIVE_FOLDER + '/inventory.csv');
     items = csvToItems(csvText);
+    setLoadingMsg('Loading photos for ' + items.length + ' item' + (items.length === 1 ? '' : 's') + '…');
     var photoMap = await loadPhotoUrlMap('/' + ONEDRIVE_FOLDER + '/photos');
     items.forEach(function(it){ it.photoUrl = it.photo ? (photoMap[it.photo] || null) : null; });
 
+    setLoadingMsg('Loading container images…');
     var cCsvText = await graphReadText('/' + ONEDRIVE_FOLDER + '/containers.csv');
     containers = csvToContainers(cCsvText);
     var cPhotoMap = await loadPhotoUrlMap('/' + ONEDRIVE_FOLDER + '/containers');
@@ -721,12 +797,15 @@
   async function reloadFromOneDrive(){
     if (!writable) return;
     try {
+      setLoading(true, 'Reloading from OneDrive\u2026');
       if (!(await ensureToken(true))) throw new Error('token refresh failed');
       await loadAllData();
+      setLoading(false);
       setStatus('on', 'Signed in as ' + (msalAccount.username || msalAccount.name) + ' \u2014 ' + items.length + ' item' + (items.length === 1 ? '' : 's'));
       render();
     } catch(err){
       console.error(err);
+      setLoading(false);
       setStatus('off', 'Signed out \u2014 click Sign in again');
       writable = false;
       addBtn.disabled = true;
@@ -1086,6 +1165,7 @@
   }
 
   function render(){
+    if (loading && items.length === 0){ renderSkeleton(); return; }
     var q = searchEl.value.trim();
     var filtered = items.filter(function(it){ return matches(it, q); });
     countEl.textContent = items.length === 0 ? '' :
@@ -1165,23 +1245,29 @@
   searchEl.addEventListener('input', render);
 
   (async function init(){
-    // MSAL loads this same page inside hidden iframes and popup windows for its own bookkeeping.
-    // Those copies must not run the app or start a sign-in of their own.
-    if (window.self !== window.top) return;
+    // MSAL loads this same page inside hidden iframes (the URL comes back with #code=... or #error=...)
+    // and popup windows for its own bookkeeping. Those copies must not run the app or sign in.
+    // A normal embedding (e.g. the dashboard) has no such hash and runs the app as usual.
+    if (FRAMED && /[#&?](code|error|state)=/.test(window.location.hash)) return;
     if (window.name && window.name.indexOf('msal.') === 0) return;
 
-    await msalReady;
-    var redirectError = null;
-    var redirectResp = null;
-    try {
-      redirectResp = await msalInstance.handleRedirectPromise();
-    } catch(err){
-      console.error(err);
-      redirectError = err;
-    }
-    clearStuckInteraction();   // nothing can be mid-sign-in on a fresh page load
+    if (FRAMED){ openFull.href = REDIRECT_URI; openFull.style.display = 'inline-flex'; }
+    // Show progress straight away if we expect to sign in automatically
+    if (getHint() || /[#&?](code|error)=/.test(window.location.hash)) setLoading(true, 'Signing you in…');
 
+    var leaving = false;
     try {
+      await msalReady;
+      var redirectError = null;
+      var redirectResp = null;
+      try {
+        redirectResp = await msalInstance.handleRedirectPromise();
+      } catch(err){
+        console.error(err);
+        redirectError = err;
+      }
+      clearStuckInteraction();   // nothing can be mid-sign-in on a fresh page load
+
       if (redirectResp && redirectResp.account){
         // Just came back from Microsoft
         msalAccount = redirectResp.account;
@@ -1196,27 +1282,42 @@
         try { msalInstance.setActiveAccount(msalAccount); } catch(e){}
         if (await ensureToken(false)){ await afterSignIn(); return; }
       }
+
+      // No usable session. If this device has signed in before, make one automatic trip to Microsoft
+      // (no typing if your Microsoft session is alive). The cooldown stops any redirect loop.
+      // Not possible inside a frame, where the user taps Sign in and a popup opens instead.
+      if (!FRAMED && !redirectError && getHint() && autoRedirectAllowed()){
+        markAutoRedirect();
+        leaving = true;
+        setLoading(true, 'Signing you back in…');
+        // Safety net: if the browser never actually leaves (e.g. restored from the back button), don't spin forever
+        setTimeout(function(){
+          if (!writable && loading){
+            setLoading(false);
+            setStatus('off', 'Session expired — tap Sign in with Microsoft');
+            render();
+          }
+        }, 15000);
+        try { await startSignIn(false); return; } catch(err){ console.error(err); leaving = false; }
+      }
+
+      setLoading(false);
+      if (redirectError){
+        setStatus('off', 'Sign-in failed (' + (redirectError.errorCode || redirectError.message || 'unknown error') + ') — tap Sign in with Microsoft');
+      } else if (getHint()){
+        setStatus('off', 'Session expired — tap Sign in with Microsoft');
+      } else {
+        setStatus('', 'Not signed in');
+      }
+      render();
     } catch(err){
       console.error(err);
+      setLoading(false);
       setStatus('off', 'Could not load your inventory — ' + (err && (err.errorCode || err.message) || 'unknown error'));
       render();
-      return;
+    } finally {
+      if (!leaving) setLoading(false);
     }
-
-    // No usable session. If this device has signed in before, make one automatic trip to Microsoft
-    // (no typing if your Microsoft session is alive). The cooldown stops any redirect loop.
-    if (!redirectError && getHint() && autoRedirectAllowed()){
-      markAutoRedirect();
-      setStatus('', 'Signing you back in…');
-      try { await startRedirectSignIn(false); return; } catch(err){ console.error(err); }
-    }
-
-    if (redirectError){
-      setStatus('off', 'Sign-in failed (' + (redirectError.errorCode || redirectError.message || 'unknown error') + ') — tap Sign in with Microsoft');
-    } else if (getHint()){
-      setStatus('off', 'Session expired — tap Sign in with Microsoft');
-    }
-    render();
   })();
 })();
 </script>
