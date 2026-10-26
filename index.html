@@ -314,11 +314,17 @@
 
   var GRAPH = 'https://graph.microsoft.com/v1.0';
   var GRAPH_SCOPES = ['Files.ReadWrite'];
+  // Must match the SPA redirect URI registered in Azure exactly (trailing slash, no index.html)
+  var REDIRECT_URI = window.location.origin + window.location.pathname.replace(/index\.html$/, '');
+  var HINT_KEY = 'inv_login_hint';          // remembered username, so Microsoft can skip the account picker
+  var AUTO_KEY = 'inv_auto_redirect_ts';    // time of the last automatic sign-in redirect (loop guard)
+  var AUTO_COOLDOWN_MS = 5 * 60 * 1000;
   var msalInstance = new msal.PublicClientApplication({
     auth: {
       clientId: CLIENT_ID,
       authority: 'https://login.microsoftonline.com/consumers',
-      redirectUri: window.location.origin + window.location.pathname
+      redirectUri: REDIRECT_URI,
+      navigateToLoginRequestUrl: false
     },
     cache: { cacheLocation: 'localStorage' }
   });
@@ -606,13 +612,48 @@
 
   }
 
+  // ---------- sign-in (redirect flow) ----------
+  // Microsoft limits browser-app sign-ins to about 24 hours. Instead of a popup, we use a full-page
+  // redirect with the remembered username: if your Microsoft session is still alive, you bounce to
+  // Microsoft and straight back with no typing.
+  function getHint(){ try { return localStorage.getItem(HINT_KEY) || ''; } catch(e){ return ''; } }
+  function setHint(v){ try { if (v) localStorage.setItem(HINT_KEY, v); else localStorage.removeItem(HINT_KEY); } catch(e){} }
+  function autoRedirectAllowed(){
+    try {
+      var last = parseInt(localStorage.getItem(AUTO_KEY) || '0', 10);
+      return !last || (Date.now() - last) > AUTO_COOLDOWN_MS;
+    } catch(e){ return false; }
+  }
+  function markAutoRedirect(){ try { localStorage.setItem(AUTO_KEY, String(Date.now())); } catch(e){} }
+
+  // MSAL sets an "interaction in progress" flag during sign-in. If a sign-in is interrupted the flag
+  // can be left behind and block every later attempt, so clear any leftover flag.
+  function clearStuckInteraction(){
+    [window.sessionStorage, window.localStorage].forEach(function(store){
+      try {
+        var drop = [];
+        for (var i = 0; i < store.length; i++){
+          var k = store.key(i);
+          if (k && /interaction\.status/i.test(k)) drop.push(k);
+        }
+        drop.forEach(function(k){ store.removeItem(k); });
+      } catch(e){}
+    });
+  }
+
+  async function startRedirectSignIn(forcePicker){
+    await msalReady;
+    clearStuckInteraction();
+    var req = { scopes: GRAPH_SCOPES, redirectUri: REDIRECT_URI };
+    var hint = getHint();
+    if (forcePicker) req.prompt = 'select_account';
+    else if (hint) req.loginHint = hint;
+    await msalInstance.loginRedirect(req);
+  }
+
   async function signIn(){
     try {
-      await msalReady;
-      var loginResp = await msalInstance.loginPopup({ scopes: GRAPH_SCOPES });
-      msalAccount = loginResp.account;
-      accessToken = loginResp.accessToken;
-      await afterSignIn();
+      await startRedirectSignIn(writable);   // already signed in = "Switch account", so show the picker
     } catch(err){
       console.error(err);
       var detail = (err && (err.errorCode || err.message)) ? (err.errorCode || err.message) : 'unknown error';
@@ -620,25 +661,34 @@
     }
   }
 
-  async function ensureToken(){
+  // Gets a fresh access token without any prompt. If that is impossible (24-hour limit reached) and the
+  // caller is a user action (save/reload), try one popup as a last resort so an unsaved edit isn't lost.
+  async function ensureToken(userAction){
     try {
       await msalReady;
       var resp = await msalInstance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: msalAccount });
       accessToken = resp.accessToken;
       return true;
     } catch(e){
+      console.warn('Silent token renewal failed:', e && (e.errorCode || e.message));
+      if (!userAction) return false;
       try {
-        var resp2 = await msalInstance.acquireTokenPopup({ scopes: GRAPH_SCOPES });
+        clearStuckInteraction();
+        var resp2 = await msalInstance.acquireTokenPopup({ scopes: GRAPH_SCOPES, account: msalAccount, redirectUri: REDIRECT_URI });
         accessToken = resp2.accessToken;
         return true;
       } catch(e2){
         console.error(e2);
+        clearStuckInteraction();
         return false;
       }
     }
   }
 
   async function afterSignIn(){
+    try { msalInstance.setActiveAccount(msalAccount); } catch(e){}
+    setHint(msalAccount.username);
+    try { localStorage.removeItem(AUTO_KEY); } catch(e){}
     await ensureFolder('/' + ONEDRIVE_FOLDER);
     await ensureFolder('/' + ONEDRIVE_FOLDER + '/photos');
     await ensureFolder('/' + ONEDRIVE_FOLDER + '/containers');
@@ -671,7 +721,7 @@
   async function reloadFromOneDrive(){
     if (!writable) return;
     try {
-      if (!(await ensureToken())) throw new Error('token refresh failed');
+      if (!(await ensureToken(true))) throw new Error('token refresh failed');
       await loadAllData();
       setStatus('on', 'Signed in as ' + (msalAccount.username || msalAccount.name) + ' \u2014 ' + items.length + ' item' + (items.length === 1 ? '' : 's'));
       render();
@@ -685,7 +735,7 @@
 
   async function saveCSV(){
     try {
-      if (!(await ensureToken())) throw new Error('token refresh failed');
+      if (!(await ensureToken(true))) throw new Error('token refresh failed');
       await graphWriteContent('/' + ONEDRIVE_FOLDER + '/inventory.csv', itemsToCSV(items), 'text/csv');
       setStatus('on', 'Signed in as ' + (msalAccount.username || msalAccount.name) + ' \u2014 ' + items.length + ' item' + (items.length === 1 ? '' : 's'));
       return true;
@@ -735,7 +785,7 @@
 
   async function saveContainersCSV(){
     try {
-      if (!(await ensureToken())) throw new Error('token refresh failed');
+      if (!(await ensureToken(true))) throw new Error('token refresh failed');
       await graphWriteContent('/' + ONEDRIVE_FOLDER + '/containers.csv', containersToCSV(containers), 'text/csv');
       return true;
     } catch(err){
@@ -1115,11 +1165,56 @@
   searchEl.addEventListener('input', render);
 
   (async function init(){
+    // MSAL loads this same page inside hidden iframes and popup windows for its own bookkeeping.
+    // Those copies must not run the app or start a sign-in of their own.
+    if (window.self !== window.top) return;
+    if (window.name && window.name.indexOf('msal.') === 0) return;
+
     await msalReady;
-    var accounts = msalInstance.getAllAccounts();
-    if (accounts.length > 0){
-      msalAccount = accounts[0];
-      if (await ensureToken()) await afterSignIn();
+    var redirectError = null;
+    var redirectResp = null;
+    try {
+      redirectResp = await msalInstance.handleRedirectPromise();
+    } catch(err){
+      console.error(err);
+      redirectError = err;
+    }
+    clearStuckInteraction();   // nothing can be mid-sign-in on a fresh page load
+
+    try {
+      if (redirectResp && redirectResp.account){
+        // Just came back from Microsoft
+        msalAccount = redirectResp.account;
+        accessToken = redirectResp.accessToken;
+        await afterSignIn();
+        return;
+      }
+
+      var accounts = msalInstance.getAllAccounts();
+      if (accounts.length > 0 && !redirectError){
+        msalAccount = accounts[0];
+        try { msalInstance.setActiveAccount(msalAccount); } catch(e){}
+        if (await ensureToken(false)){ await afterSignIn(); return; }
+      }
+    } catch(err){
+      console.error(err);
+      setStatus('off', 'Could not load your inventory — ' + (err && (err.errorCode || err.message) || 'unknown error'));
+      render();
+      return;
+    }
+
+    // No usable session. If this device has signed in before, make one automatic trip to Microsoft
+    // (no typing if your Microsoft session is alive). The cooldown stops any redirect loop.
+    if (!redirectError && getHint() && autoRedirectAllowed()){
+      markAutoRedirect();
+      setStatus('', 'Signing you back in…');
+      try { await startRedirectSignIn(false); return; } catch(err){ console.error(err); }
+    }
+
+    if (redirectError){
+      setStatus('off', 'Sign-in failed (' + (redirectError.errorCode || redirectError.message || 'unknown error') + ') — tap Sign in with Microsoft');
+    } else if (getHint()){
+      setStatus('off', 'Session expired — tap Sign in with Microsoft');
     }
     render();
   })();
